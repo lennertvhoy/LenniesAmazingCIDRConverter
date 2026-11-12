@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""Run the slice's primary journey and record what happened, so the state files are observed, not asserted.
+
+    python3 scripts/projectstate_verify.py [--root DIR] [--run] [--timeout SECONDS]
+
+An agent that types ``Result: passed`` into the records can be wrong, and the next session (or the owner) then
+steers by a false anchor. This command runs the journey command recorded in ``STATE.yaml`` and writes the outcome
+itself: ``current_slice.primary_journey.status`` and ``validation.primary_journey`` (passed on exit 0, otherwise
+failed), and ``Command``, ``Environment``, ``Result``, ``Exit code`` and ``Verified`` in the evidence summary, plus
+``last-journey-run.txt`` with the output tail. STATE.yaml is edited in place so quoting and comments survive.
+
+Without ``--run`` it only prints what it would execute. The command is run through ``bash -c`` from the repository
+root with the caller's environment: running it is exactly as trusted as typing it yourself, so use ``--run`` only in a
+repository whose recorded command you would run. A passed journey marks a ``planned``, ``implementing`` or
+``implemented`` slice ``validated`` (that is what the word means) unless the gate still lists a blocker, and then the
+status stays and the blockers are printed. A failed journey downgrades a ``validated`` or ``ready_for_human`` slice to
+``implementing``. An ``accepted`` slice is never altered (the command reports the failure and exits 2: tell the
+owner). If the gate reports any new error after the edit, every file is restored byte for byte. The last thing printed
+is the gate's own verdict on the records as they now stand.
+
+Exit codes: 0 journey passed and recorded; 1 journey failed and recorded; 2 refused, or rolled back, nothing recorded.
+This is not the gate: the gate stays read-only and never executes anything.
+
+    python3 scripts/projectstate_verify.py --root DIR --receipt [--run] [--in-place] [--receipts DIR] [--by WHO]
+
+``--receipt`` is the same run for someone who is not the repository's writer: a reviewer, the owner, or a fleet check.
+The tool itself writes nothing in the repository. The journey runs in a temporary copy (a clone of the committed HEAD,
+or a file copy when the directory has no git), so uncommitted work is not part of the run and what the journey writes
+in its own directory stays in the copy. The copy is not a sandbox: a command that names the repository by its absolute
+path, or follows a symlink that points into it, still reaches it, so read the command before ``--run`` as you would
+before typing it. ``--in-place`` runs it in the working tree instead, for a journey that needs uncommitted files. The
+result goes to a receipt outside the repository, ``<receipts>/<repository>/<slice>.json`` (default
+``~/.local/state/projectstate/journeys``), with the output tail beside it as ``<slice>.log``. The receipt names the
+command and its sha256, the HEAD it ran against, where it ran, the exit code and the time, so the fleet doctor can tell
+a slice whose journey someone else has run from one whose only proof is its own records. The exit codes are the same.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, NamedTuple
+
+try:
+    import projectstate_gate as gatelib
+except ModuleNotFoundError:  # pragma: no cover - pytest package import path
+    from scripts import projectstate_gate as gatelib
+
+RECORDED_BY = "scripts/projectstate_verify.py"
+ARTIFACT = "last-journey-run.txt"
+DEFAULT_TIMEOUT = 900
+TAIL_LINES = 60
+TAIL_BYTES = 6000
+CLOSED_BEFORE_PASS = ("validated", "ready_for_human")
+# A passed journey is what `validated` means, so the tool sets it; `blocked` and the closed statuses are left alone.
+OPEN_BEFORE_PASS = ("planned", "implementing", "implemented")
+PLACEHOLDER = re.compile(r"not yet defined|^\s*(todo|tbd)\b", re.IGNORECASE)
+KEY_LINE = re.compile(r"^(?P<key>[A-Za-z0-9_.-]+):(?P<rest>.*)$")
+VALUE_LINE = re.compile(
+    r"^(?P<head>[ ]*[A-Za-z0-9_.-]+:[ \t]*)"
+    r"(?P<token>\"[^\"\\]*\"|'[^']*'|[^\s\"'#][^\s#]*)"
+    r"(?P<tail>[ \t]*|[ \t]+#.*)$"
+)
+SECTION = re.compile(r"^##\s+(.+?)\s*$")
+SLICE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+LABEL_LINE = re.compile(r"^-\s+[A-Za-z][A-Za-z ]*:")
+RECEIPT_FORMAT = "projectstate-journey-receipt/1"
+DEFAULT_RECEIPTS = "~/.local/state/projectstate/journeys"
+RECEIPT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+GIT_TIMEOUT = 600
+# Variables that would point git at a different repository than the one being verified.
+GIT_REDIRECT_VARS = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_QUARANTINE_PATH",
+})
+
+
+class Refused(Exception):
+    def __init__(self, reasons: list[str]) -> None:
+        super().__init__("; ".join(reasons))
+        self.reasons = reasons
+
+
+class Entry(NamedTuple):
+    index: int
+    indent: int
+    key: str
+
+
+class Outcome(NamedTuple):
+    code: int
+    seconds: float
+    timed_out: bool
+    tail: str
+
+
+# --- reading the instance ---------------------------------------------------------------------------------------
+
+
+def regular(root: Path, relative: str) -> Path:
+    """A file inside ``root`` reached without a symlink; refuse anything else."""
+    current = root
+    if Path(relative).is_absolute() or ".." in Path(relative).parts:
+        raise Refused([f"{relative} does not stay inside the repository; refusing to read or write it"])
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise Refused([f"{relative} is reached through a symlink; refusing to read or write it"])
+    if not current.is_file():
+        raise Refused([f"{relative} is missing or not a regular file"])
+    return current
+
+
+def journey_of(payload: dict[str, Any]) -> tuple[str, str, str, str]:
+    try:
+        current = payload["current_slice"]
+        journey = current["primary_journey"]
+        slice_id, status = str(current["id"]), str(current["status"])
+        command, environment = str(journey["command"]).strip(), str(journey["environment"]).strip()
+    except (KeyError, TypeError) as error:
+        raise Refused([f"STATE.yaml has no usable current_slice.primary_journey ({error})"]) from error
+    if not SLICE_ID.fullmatch(slice_id):
+        # The id names the evidence folder: anything else (a path separator, "..") could point outside the repository.
+        raise Refused(["current_slice.id must use lowercase letters, digits, and hyphens; nothing was run"])
+    if not command or PLACEHOLDER.search(command):
+        raise Refused(["the primary journey command is empty or still a placeholder; record the real command first"])
+    return slice_id, status, command, environment
+
+
+# --- running the journey ------------------------------------------------------------------------------------------
+
+
+def run_journey(command: str, root: Path, timeout: float) -> Outcome:
+    shell = "bash" if shutil.which("bash") else "sh"
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    started = dt.datetime.now(dt.timezone.utc)
+    try:
+        process = subprocess.Popen(
+            [shell, "-c", command], cwd=root, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", start_new_session=True,
+        )
+    except OSError as error:
+        return Outcome(127, 0.0, False, f"cannot start {shell}: {error}")
+    timed_out = False
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        output, _ = process.communicate()
+    seconds = (dt.datetime.now(dt.timezone.utc) - started).total_seconds()
+    tail = "\n".join(output.splitlines()[-TAIL_LINES:])[-TAIL_BYTES:]
+    code = 124 if timed_out else process.returncode
+    return Outcome(code, seconds, timed_out, tail)
+
+
+# --- editing STATE.yaml in place ----------------------------------------------------------------------------------
+
+
+def entries_of(lines: list[str]) -> list[Entry]:
+    found: list[Entry] = []
+    for index, raw in enumerate(lines):
+        body = raw.splitlines()[0] if raw.splitlines() else ""
+        if not body.strip() or body.lstrip().startswith("#"):
+            continue
+        stripped = body.lstrip(" ")
+        match = KEY_LINE.match(stripped)
+        found.append(Entry(index, len(body) - len(stripped), match["key"] if match else ""))
+    return found
+
+
+def locate(entries: list[Entry], path: tuple[str, ...]) -> Entry:
+    """The line holding the nested key ``path`` in a plain block mapping."""
+    scope = entries
+    current: Entry | None = None
+    for key in path:
+        top = scope[0].indent if scope else 0
+        matches = [entry for entry in scope if entry.indent == top and entry.key == key]
+        if len(matches) != 1:
+            raise Refused([f"cannot edit STATE.yaml in place: expected one '{key}:' line at its level, found {len(matches)}"])
+        current = matches[0]
+        start = scope.index(current) + 1
+        block: list[Entry] = []
+        for entry in scope[start:]:
+            if entry.indent <= current.indent:
+                break
+            block.append(entry)
+        scope = block
+    assert current is not None
+    return current
+
+
+def retarget(body: str, new: str, label: str) -> str:
+    match = VALUE_LINE.match(body)
+    if match is None:
+        raise Refused([f"cannot edit {label} in place: unsupported line {body.strip()!r}"])
+    token = match["token"]
+    quote = token[0] if token[0] in "\"'" else ""
+    return f"{match['head']}{quote}{new}{quote}{match['tail']}"
+
+
+def edit_state(text: str, payload: dict[str, Any], status: str, slice_status: str | None) -> str:
+    lines = text.splitlines(keepends=True)
+    entries = entries_of(lines)
+    changes: list[tuple[tuple[str, ...], str]] = [
+        (("current_slice", "primary_journey", "status"), status),
+        (("validation", "primary_journey"), status),
+    ]
+    expected = copy.deepcopy(payload)
+    expected["current_slice"]["primary_journey"]["status"] = status
+    expected["validation"]["primary_journey"] = status
+    if slice_status is not None:
+        changes.append((("current_slice", "status"), slice_status))
+        expected["current_slice"]["status"] = slice_status
+    for path, new in changes:
+        entry = locate(entries, path)
+        body = lines[entry.index].splitlines()[0]
+        lines[entry.index] = retarget(body, new, ".".join(path)) + lines[entry.index][len(body):]
+    new_text = "".join(lines)
+    try:
+        reparsed = gatelib.parse_state(new_text)
+    except gatelib.StateSyntaxError as error:
+        raise Refused([f"the edited STATE.yaml no longer parses ({error}); nothing was written"]) from error
+    if reparsed != expected:
+        raise Refused(["the edited STATE.yaml differs in more than the journey fields; nothing was written"])
+    return new_text
+
+
+# --- editing the evidence summary ---------------------------------------------------------------------------------
+
+
+def edit_summary(text: str, command: str, environment: str, result: str, outcome: Outcome, when: str) -> str:
+    newline = "\r\n" if "\r\n" in text and "\n" not in text.replace("\r\n", "") else "\n"
+    lines = text.replace("\r\n", "\n").split("\n")
+    heads = [(i, SECTION.match(line)) for i, line in enumerate(lines)]
+    heads = [(i, m.group(1).strip().lower()) for i, m in heads if m]
+    names = [name for _, name in heads]
+    if names.count("primary journey") != 1 or "artifacts" not in names:
+        raise Refused(["the evidence summary needs one '## Primary journey' and one '## Artifacts' section"])
+    start = next(i for i, name in heads if name == "primary journey")
+    end = next((i for i, _ in heads if i > start), len(lines))
+    wanted = {
+        "Environment": environment,
+        "Command": f"`{command}`",
+        "Result": result,
+        "Exit code": str(outcome.code),
+        "Verified": f"{when} by {RECORDED_BY} in {outcome.seconds:.1f}s" + (" (timed out)" if outcome.timed_out else ""),
+    }
+    section = [line for line in lines[start + 1:end]]
+    for label, value in wanted.items():
+        pattern = re.compile(rf"^-\s+{re.escape(label)}:", re.IGNORECASE)
+        hits = [i for i, line in enumerate(section) if pattern.match(line)]
+        replacement = f"- {label}: {value}"
+        if hits:
+            section[hits[0]] = replacement
+            for extra in reversed(hits[1:]):
+                del section[extra]
+        else:
+            # Beside the other "- Label: value" lines, not after prose that follows them; a section without any
+            # such line gets the new one after its last text.
+            labelled = [i for i, line in enumerate(section) if LABEL_LINE.match(line)]
+            insert_at = (labelled[-1] if labelled
+                         else max((i for i, line in enumerate(section) if line.strip()), default=-1)) + 1
+            section.insert(insert_at, replacement)
+    lines[start + 1:end] = section
+    lines = add_artifact_line(lines)
+    return "\n".join(lines).replace("\n", newline)
+
+
+def add_artifact_line(lines: list[str]) -> list[str]:
+    """Name the run output under ## Artifacts (once), dropping the scaffold's '- None recorded.' placeholder."""
+    heads = [(i, m.group(1).strip().lower()) for i, m in ((i, SECTION.match(line)) for i, line in enumerate(lines)) if m]
+    start = next(i for i, name in heads if name == "artifacts")
+    stop = next((i for i, _ in heads if i > start), len(lines))
+    body = [line for line in lines[start + 1:stop] if line.strip() and line.strip() != "- None recorded."]
+    if not any(ARTIFACT in line for line in body):
+        body.append(f"- {ARTIFACT}: output of the most recent verified journey run.")
+    return lines[:start + 1] + ["", *body, ""] + lines[stop:]
+
+
+# --- writing -------------------------------------------------------------------------------------------------------
+
+
+def write_atomic(path: Path, data: bytes, mode: int) -> None:
+    handle, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def artifact_text(command: str, outcome: Outcome, when: str) -> str:
+    status = "timed out" if outcome.timed_out else f"exit code {outcome.code}"
+    return f"# {RECORDED_BY}\n# command: {command}\n# finished: {when}\n# {status} after {outcome.seconds:.1f}s\n\n{outcome.tail}\n"
+
+
+def record(root: Path, args: argparse.Namespace) -> int:
+    state_path = regular(root, "STATE.yaml")
+    state_text = state_path.read_bytes().decode("utf-8")
+    try:
+        payload = gatelib.parse_state(state_text)
+    except gatelib.StateSyntaxError as error:
+        raise Refused([f"STATE.yaml does not parse: {error}"]) from error
+    slice_id, status, command, environment = journey_of(payload)
+    summary_path = regular(root, f"evidence/{slice_id}/summary.md")
+    print(f"slice {slice_id} ({status})\n  command:     {command}\n  environment: {environment}\n  run from:    {root}")
+    if not args.run:
+        print("dry run: nothing executed. Re-run with --run to execute the command and record the result.")
+        return 0
+    artifact_path = summary_path.parent / ARTIFACT
+    if artifact_path.is_symlink() or (artifact_path.exists() and not artifact_path.is_file()):
+        raise Refused([f"evidence/{slice_id}/{ARTIFACT} is a symlink or not a regular file; refusing to replace it"])
+    before_errors, _blockers, _warn = gatelib.validate(root)
+    outcome = run_journey(command, root, args.timeout)
+    # The journey ran repository code. Check again that what is about to be written is still what was checked.
+    if (regular(root, "STATE.yaml") != state_path or regular(root, f"evidence/{slice_id}/summary.md") != summary_path
+            or artifact_path.is_symlink() or (artifact_path.exists() and not artifact_path.is_file())):
+        raise Refused(["the journey changed the files this tool records into; nothing was recorded"])
+    passed = outcome.code == 0
+    if not passed and status == "accepted":
+        print(f"the journey FAILED (exit {outcome.code}) but the slice is accepted; nothing recorded. Tell the owner.", file=sys.stderr)
+        return 2
+    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    result = "passed" if passed else "failed"
+    if passed:
+        slice_status = "validated" if status in OPEN_BEFORE_PASS else None
+    else:
+        slice_status = "implementing" if status in CLOSED_BEFORE_PASS else None
+    new_state = edit_state(state_text, payload, result, slice_status)
+    summary_old = summary_path.read_bytes()
+    new_summary = edit_summary(summary_old.decode("utf-8"), command, environment, result, outcome, now)
+    artifact_old = artifact_path.read_bytes() if artifact_path.is_file() else None
+    originals = [(state_path, state_text.encode("utf-8"), state_path.stat().st_mode & 0o777),
+                 (summary_path, summary_old, summary_path.stat().st_mode & 0o777)]
+
+    def restore() -> list[str]:
+        """Put the three files back; return what could not be restored."""
+        failed: list[str] = []
+        for path, original, mode in originals:
+            try:
+                write_atomic(path, original, mode)
+            except OSError as error:
+                failed.append(f"{path.name}: {error}")
+        try:
+            if artifact_old is None:
+                artifact_path.unlink(missing_ok=True)
+            else:
+                write_atomic(artifact_path, artifact_old, 0o644)
+        except OSError as error:
+            failed.append(f"{ARTIFACT}: {error}")
+        return failed
+
+    def restored_note() -> str:
+        failed = restore()
+        return "everything was restored" if not failed else "COULD NOT RESTORE " + "; ".join(failed)
+
+    try:
+        write_atomic(state_path, new_state.encode("utf-8"), originals[0][2])
+        write_atomic(summary_path, new_summary.encode("utf-8"), originals[1][2])
+        write_atomic(artifact_path, artifact_text(command, outcome, now).encode("utf-8"), 0o644)
+        after_errors, blockers, _warn = gatelib.validate(root)
+        added = [error for error in after_errors if error not in before_errors]
+        held_back: list[str] = []
+        if not added and passed and slice_status == "validated" and blockers:
+            # The journey passed but something else still blocks the outcome: keep the result, not the new status.
+            held_back = blockers
+            slice_status = None
+            write_atomic(state_path, edit_state(state_text, payload, result, None).encode("utf-8"), originals[0][2])
+            after_errors, _blockers, _warn = gatelib.validate(root)
+            added = [error for error in after_errors if error not in before_errors]
+        if added:
+            raise Refused([f"the gate reports new errors after recording: {'; '.join(added)}"])
+    except Refused as error:
+        raise Refused([*error.reasons, restored_note()]) from error
+    except OSError as error:
+        raise Refused([f"write failed ({error}); {restored_note()}"]) from error
+    verdict = "PASSED" if passed else ("TIMED OUT" if outcome.timed_out else f"FAILED (exit {outcome.code})")
+    print(f"journey {verdict} in {outcome.seconds:.1f}s; recorded in STATE.yaml and evidence/{slice_id}/summary.md")
+    if slice_status == "validated":
+        print(f"slice status set from {status} to validated")
+    elif slice_status == "implementing":
+        print(f"slice status downgraded from {status} to implementing")
+    elif held_back:
+        print(f"slice status stays {status}: " + "; ".join(held_back[:3]))
+    if not passed:
+        print("--- output tail ---\n" + "\n".join(outcome.tail.splitlines()[-15:]))
+    print("--- gate ---")
+    gatelib.main(["--root", str(root)])
+    return 0 if passed else 1
+
+
+# --- an independent run: a receipt outside the repository ---------------------------------------------------------
+
+
+def git_read(root: Path, *args: str) -> str | None:
+    """Output of one read-only git command against ``root`` itself; None when git or the command fails."""
+    env = {key: value for key, value in os.environ.items() if key not in GIT_REDIRECT_VARS}
+    # No optional locks: a status must not refresh the index. The ceiling keeps git from climbing into a parent repository.
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CEILING_DIRECTORIES=str(root.parent))
+    try:
+        done = subprocess.run(
+            ["git", "--no-pager", "-C", str(root), "-c", "core.fsmonitor=false", *args],
+            capture_output=True, stdin=subprocess.DEVNULL, text=True, errors="replace", env=env, timeout=GIT_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def git_state(root: Path) -> tuple[str | None, int | None]:
+    """(HEAD, number of uncommitted paths) when ``root`` is the top of a git work tree with a commit, else (None, None)."""
+    top = git_read(root, "rev-parse", "--show-toplevel")
+    if top is None or Path(top.strip()).resolve() != root:
+        return None, None
+    head = (git_read(root, "rev-parse", "--verify", "HEAD") or "").strip()
+    if not head:
+        return None, None
+    status = git_read(root, "status", "--porcelain", "--untracked-files=normal")
+    return head, (None if status is None else len(status.splitlines()))
+
+
+def snapshot(root: Path, head: str | None, parent: Path) -> tuple[Path, str]:
+    """A temporary copy to run in: the committed HEAD when there is one, otherwise the files as they are."""
+    copy_root = parent / root.name
+    if head is None:
+        try:
+            shutil.copytree(root, copy_root, symlinks=True)
+        except (OSError, shutil.Error) as error:
+            raise Refused([f"cannot copy {root} to a temporary directory ({error})"]) from error
+        return copy_root, "copy"
+    # A local clone only reads the source. --no-hardlinks: nothing in the copy shares a file with the repository.
+    if git_read(root, "clone", "--quiet", "--no-hardlinks", str(root), str(copy_root)) is None:
+        raise Refused([f"cannot clone {root} to a temporary directory; use --in-place to run in the working tree"])
+    if git_read(root, "-C", str(copy_root), "checkout", "--quiet", "--detach", head) is None:
+        raise Refused([f"the temporary clone cannot check out {head}"])
+    return copy_root, "clone-of-head"
+
+
+def receipt_paths(root: Path, slice_id: str, receipts: Path) -> tuple[Path, Path]:
+    if is_inside(receipts, root):
+        raise Refused([f"the receipts directory {receipts} is inside the repository; a receipt must live outside it"])
+    for label, value in (("repository directory name", root.name), ("slice id", slice_id)):
+        if not RECEIPT_NAME.fullmatch(value):
+            raise Refused([f"the {label} {value!r} cannot be used as a receipt file name"])
+    folder = receipts / root.name
+    return folder / f"{slice_id}.json", folder / f"{slice_id}.log"
+
+
+def is_inside(path: Path, parent: Path) -> bool:
+    return path == parent or parent in path.parents
+
+
+def receipt(root: Path, args: argparse.Namespace) -> int:
+    state_path = regular(root, "STATE.yaml")
+    try:
+        payload = gatelib.parse_state(state_path.read_bytes().decode("utf-8"))
+    except (gatelib.StateSyntaxError, UnicodeDecodeError) as error:
+        raise Refused([f"STATE.yaml does not parse: {error}"]) from error
+    slice_id, status, command, environment = journey_of(payload)
+    recorded = str(payload["current_slice"]["primary_journey"].get("status"))
+    receipt_path, log_path = receipt_paths(root, slice_id, Path(args.receipts).expanduser().resolve())
+    head, dirty = git_state(root)
+    where = "the working tree" if args.in_place else ("a temporary clone of HEAD" if head else "a temporary copy of the files")
+    print(f"slice {slice_id} ({status}), journey recorded as {recorded}\n  command:     {command}\n"
+          f"  environment: {environment}\n  run in:      {where}\n  receipt:     {receipt_path}")
+    if not args.run:
+        print("dry run: nothing executed. Re-run with --run to execute the command and write the receipt.")
+        return 0
+    started = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if args.in_place:
+        ran_in, outcome = "working-tree", run_journey(command, root, args.timeout)
+    else:
+        with tempfile.TemporaryDirectory(prefix="projectstate-journey-") as holder:
+            copy_root, ran_in = snapshot(root, head, Path(holder))
+            outcome = run_journey(command, copy_root, args.timeout)
+    passed = outcome.code == 0
+    document = {
+        "format": RECEIPT_FORMAT,
+        "repository": root.name,
+        "path": str(root),
+        "slice": slice_id,
+        "slice_status": status,
+        "recorded_journey": recorded,
+        "command": command,
+        "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        "environment_recorded": environment,
+        "ran_in": ran_in,
+        "head": head,
+        "uncommitted_paths": dirty,
+        "started": started,
+        "seconds": round(outcome.seconds, 1),
+        "exit_code": outcome.code,
+        "timed_out": outcome.timed_out,
+        "result": "passed" if passed else "failed",
+        "output_tail_sha256": hashlib.sha256(outcome.tail.encode("utf-8")).hexdigest(),
+        "by": args.by,
+        "tool": RECORDED_BY,
+        "tool_release": getattr(gatelib, "RELEASE", None),
+    }
+    try:
+        receipt_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        write_atomic(log_path, artifact_text(command, outcome, started).encode("utf-8"), 0o600)
+        write_atomic(receipt_path, (json.dumps(document, indent=2) + "\n").encode("utf-8"), 0o600)
+    except OSError as error:
+        raise Refused([f"cannot write the receipt ({error})"]) from error
+    verdict = "PASSED" if passed else ("TIMED OUT" if outcome.timed_out else f"FAILED (exit {outcome.code})")
+    print(f"journey {verdict} in {outcome.seconds:.1f}s in {where}; receipt written, nothing recorded in the repository")
+    if ran_in == "clone-of-head" and dirty:
+        print(f"note: {dirty} uncommitted path(s) in the working tree were not part of this run")
+    if passed != (recorded == "passed"):
+        print(f"note: the repository records this journey as {recorded}; this run {'passed' if passed else 'did not pass'}")
+    if not passed:
+        print("--- output tail ---\n" + "\n".join(outcome.tail.splitlines()[-15:]))
+    return 0 if passed else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run the primary journey and record the observed result")
+    parser.add_argument("--root", default=".", help="Repository root (default: current directory)")
+    parser.add_argument("--run", action="store_true", help="Execute the recorded command (without it, only print the plan)")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Seconds before the journey is killed")
+    parser.add_argument("--receipt", action="store_true",
+                        help="Independent run: write nothing in the repository and record the result as a receipt outside it")
+    parser.add_argument("--in-place", action="store_true",
+                        help="With --receipt: run in the working tree instead of a temporary copy")
+    parser.add_argument("--receipts", default=DEFAULT_RECEIPTS, help=f"With --receipt: where receipts are kept (default: {DEFAULT_RECEIPTS})")
+    parser.add_argument("--by", default="", help="With --receipt: who or what ran the journey, recorded in the receipt")
+    args = parser.parse_args(argv)
+    if args.in_place and not args.receipt:
+        parser.error("--in-place only applies to --receipt")
+    try:
+        if args.receipt:
+            return receipt(Path(args.root).resolve(), args)
+        return record(Path(args.root).resolve(), args)
+    except Refused as error:
+        for reason in error.reasons:
+            print(f"refused: {reason}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
